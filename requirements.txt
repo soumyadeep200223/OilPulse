@@ -1,0 +1,10 @@
+streamlit
+plotly
+pandas
+numpy
+requests
+newsapi-python
+arch
+yfinance
+scikit-learn
+tensorflow
