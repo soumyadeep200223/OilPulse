@@ -7,7 +7,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 def get_latest_oil_news():
     try:
-        api_key = "bcf1e4a7be1843129f9d5e92cf207e01"
+        api_key = st.secrets["newsapi_key"]
         url = (
             f"https://newsapi.org/v2/everything?"
             f"q=oil+crude+OPEC&"
@@ -943,4 +943,5 @@ elif page == "🔬 Model Info":
         "Knowing the market is in CRISIS regime changes "
         "which stocks you watch, even without a precise "
         "price forecast. That is the actionable insight."
+
     )
