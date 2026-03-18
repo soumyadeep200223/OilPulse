@@ -7,4 +7,4 @@ newsapi-python
 arch
 yfinance
 scikit-learn
-tensorflow
+tensorflow-cpu
