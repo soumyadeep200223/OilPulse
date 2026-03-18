@@ -5,9 +5,97 @@ import plotly.graph_objects as go
 import plotly.express as px
 import urllib.request
 import xml.etree.ElementTree as ET
+import yfinance as yf
+from arch import arch_model
+import pickle
+from tensorflow.keras.models import load_model
+from datetime import timedelta
+import warnings
+warnings.filterwarnings('ignore')
+@st.cache_data(ttl=3600)
+def run_live_pipeline():
+    
+    # Step 1 — Fetch live data
+    ticker = yf.Ticker("BZ=F")
+    df = ticker.history(period="3y")
+    df = df[["Close"]].reset_index()
+    df.columns = ["Date", "Close"]
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df["return"] = df["Close"].pct_change() * 100
+    df = df.dropna().reset_index(drop=True)
+    
+    # Step 2 — Fit GARCH
+    returns = df["return"].dropna()
+    model_garch = arch_model(returns, vol="Garch", p=1, q=1, dist="normal")
+    result = model_garch.fit(disp="off")
+    df["garch_vol"] = result.conditional_volatility
+    
+    # Step 3 — Classify regimes
+    p25 = df["garch_vol"].quantile(0.25)
+    p75 = df["garch_vol"].quantile(0.75)
+    p90 = df["garch_vol"].quantile(0.90)
+    
+    def classify(v):
+        if v <= p25:   return "LOW"
+        elif v <= p75: return "ELEVATED"
+        elif v <= p90: return "HIGH"
+        else:          return "CRISIS"
+    
+    df["regimes"] = df["garch_vol"].apply(classify)
+    
+    # Step 4 — Feature engineering
+    df["garch_vol_lag1"]  = df["garch_vol"].shift(1)
+    df["garch_vol_lag5"]  = df["garch_vol"].shift(5)
+    df["garch_vol_lag10"] = df["garch_vol"].shift(10)
+    df["garch_vol_lag21"] = df["garch_vol"].shift(21)
+    df["rolling_vol_5"]   = df["return"].rolling(5).std()
+    df["rolling_vol_21"]  = df["return"].rolling(21).std()
+    df["rolling_vol_63"]  = df["return"].rolling(63).std()
+    df["vol_ratio"]       = df["rolling_vol_5"] / df["rolling_vol_63"]
+    df["momentum_5"]      = df["return"].rolling(5).mean()
+    df["momentum_21"]     = df["return"].rolling(21).mean()
+    regime_map = {"LOW":0,"ELEVATED":1,"HIGH":2,"CRISIS":3}
+    df["regime_encoded"]  = df["regimes"].map(regime_map)
+    df = df.dropna().reset_index(drop=True)
+    
+    # Step 5 — Load scalers
+    with open("scaler_X.pkl", "rb") as f:
+        scaler_X = pickle.load(f)
+    with open("scaler_y.pkl", "rb") as f:
+        scaler_y = pickle.load(f)
+    
+    # Step 6 — Create sequence
+    feature_cols = ["garch_vol_lag1","garch_vol_lag5","garch_vol_lag10",
+                    "garch_vol_lag21","rolling_vol_5","rolling_vol_21",
+                    "rolling_vol_63","vol_ratio","momentum_5",
+                    "momentum_21","regime_encoded"]
+    
+    X = df[feature_cols].values
+    X_scaled = scaler_X.transform(X)
+    last_seq = X_scaled[-30:].reshape(1, 30, 11)
+    
+    # Step 7 — Load LSTM and predict
+    lstm = load_model("lstm_model.h5", compile=False)
+    lstm.compile(optimizer="adam", loss="mse")
+    pred_scaled = lstm.predict(last_seq, verbose=0)
+    pred_vol = scaler_y.inverse_transform(pred_scaled).flatten()
+    
+    # Step 8 — Build forecast dataframe
+    last_date = df["Date"].iloc[-1]
+    forecast_dates = pd.bdate_range(
+        start=last_date + timedelta(days=1),
+        periods=30
+    )
+    forecast_df = pd.DataFrame({
+        "Date": forecast_dates,
+        "predicted_vol": pred_vol
+    })
+    forecast_df["predicted_regime"] = forecast_df["predicted_vol"].apply(classify)
+    
+    return df, forecast_df
 def get_latest_oil_news():
     try:
-        api_key = st.secrets["newsapi_key"]
+        api_key = "bcf1e4a7be1843129f9d5e92cf207e01"
         url = (
             f"https://newsapi.org/v2/everything?"
             f"q=oil+crude+OPEC&"
@@ -169,8 +257,7 @@ header[data-testid="stHeader"] {
 </style>
 """, unsafe_allow_html=True)
 #load data
-oil_data = pd.read_csv('oil_complete.csv', parse_dates=['Date'])
-oil_data['regimes'] = oil_data['regimes'].str.strip()
+oil_data,forecast_df = run_live_pipeline()
 perf = pd.read_csv('regime_performance.csv')
 #sidebar
 last = oil_data.iloc[-1]
@@ -190,7 +277,7 @@ st.sidebar.markdown("""
     font-size: 0.65rem;
     color: #4a5568;
     margin-bottom: 16px;
-'>v1.0 · Data through Dec 2024</div>
+'>v2.0 · Live Data · Updates Hourly</div>
 """, unsafe_allow_html=True)
 st.sidebar.markdown("---")
 regime_colors = {
@@ -220,7 +307,7 @@ st.sidebar.markdown(f"""
     font-size: 0.65rem;
     color: #4a5568;
     margin-bottom: 8px;
-'>As of Dec 2024</div>
+'>As of {last["Date"].strftime("%b %d, %Y")}</div>
 """, unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
@@ -236,7 +323,7 @@ div[role="radiogroup"] label p {
 </style>
 """, unsafe_allow_html=True)
 # PERSISTENT TOP HEADER — shows on every page
-st.markdown("""
+st.markdown(f"""
 <div style='
     display: flex;
     align-items: center;
@@ -273,7 +360,7 @@ st.markdown("""
             font-size: 0.65rem;
             color: #4a5568;
             margin-top: 2px;
-        '>Economics → ML · 2007–2024</div>
+        '>Economics → ML · Live as of {last["Date"].strftime("%b %Y")}</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -282,15 +369,15 @@ page = st.sidebar.radio("Navigate",[
     "📊 Market Overview",
     "📈 LSTM Forecast",
     "🏦 Stock Performance",
-    "🔬 Model Info"
+    "🔬 Model Info",
+    "🔮 30-Day Prediction"
 ])
 
 #page routing
 if page == "📊 Market Overview" :
     
     st.title("📊 Market Overview")
-    st.markdown("*BRENT Crude Oil · GARCH Volatility · Regime Classification · 2007–2024*")
-
+    st.markdown(f"*BRENT Crude Oil · GARCH Volatility · Regime Classification · Live as of {last['Date'].strftime('%b %d, %Y')}*")
     # TOP METRICS
     col1, col2, col3, col4 = st.columns(4)
 
@@ -308,8 +395,9 @@ if page == "📊 Market Overview" :
         value=current_regime
     )
     col4.metric(
-        label="Data Period",
-        value="2007-2024"
+    label="Last Updated",
+    value=last['Date'].strftime("%b %d, %Y"),
+    delta="Live via Yahoo Finance"
     )
 
     st.markdown("---")
@@ -376,14 +464,16 @@ if page == "📊 Market Overview" :
     st.markdown("---")
 
     # REGIME DISTRIBUTION
-    st.subheader("Regime Distribution — 17 Years")
-
-    counts = oil_data["regimes"].value_counts()
+    # Last 3 years only
+    three_years_ago = oil_data["Date"].max() - pd.DateOffset(years=3)
+    recent_data = oil_data[oil_data["Date"] >= three_years_ago]
+    st.subheader(f"Regime Distribution — Last 3 Years ({three_years_ago.strftime('%b %Y')} to {oil_data['Date'].max().strftime('%b %Y')})")
+    counts = recent_data["regimes"].value_counts()
     col1, col2, col3, col4 = st.columns(4)
 
     for col, regime in zip([col1, col2, col3, col4],
                            ["LOW", "ELEVATED", "HIGH", "CRISIS"]):
-        pct = counts.get(regime, 0) / len(oil_data) * 100
+        pct = counts.get(regime, 0) / len(recent_data) * 100
         col.metric(
             regime,
             f"{pct:.1f}%",
@@ -640,7 +730,7 @@ elif page == "📈 LSTM Forecast":
 
     # TRAIN TEST SPLIT VISUALIZATION
     st.subheader("GARCH Volatility — Training vs Test Period")
-
+    st.info("📌 This page shows the historical training and validation analysis. For live predictions see the 🔮 30-Day Prediction page.")
     features = pd.read_csv("lstm_features.csv", parse_dates=["Date"])
 
     split_date = pd.Timestamp("2023-01-01")
@@ -794,8 +884,8 @@ elif page == "🔬 Model Info":
             "**01**\n\n"
             "**Raw Oil Returns**\n\n"
             "BRENT daily returns\n"
-            "2007–2024\n"
-            "4,331 observations"
+            f"2023–{oil_data['Date'].max().strftime('%Y')}\n"
+            f"{len(oil_data):,} observations"
         )
     with col2:
         st.info(
@@ -837,8 +927,16 @@ elif page == "🔬 Model Info":
 
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("Total Observations", "4,331", "Daily oil prices")
-    col2.metric("Study Period", "17 Years", "Jul 2007 – Dec 2024")
+    col1.metric(
+    "Total Observations", 
+    f"{len(oil_data):,}", 
+    "Daily oil prices (live)"
+    )
+    col2.metric(
+    "Training Period", 
+    "17 Years", 
+    "Jul 2007 – Dec 2024"
+    )
     col3.metric("Stocks Tracked", "14", "NSE-listed equities")
     col4.metric("Volatility Regimes", "4", "LOW / ELEVATED / HIGH / CRISIS")
 
@@ -925,7 +1023,7 @@ elif page == "🔬 Model Info":
             "**Data Source**\n\n"
             "BRENT Crude Oil — Yahoo Finance\n"
             "NSE Stock Prices — Yahoo Finance\n"
-            "Period: Jul 2007 – Dec 2024"
+            f"Period: Live · Last {oil_data['Date'].max().strftime('%b %d, %Y')}"
         )
 
     st.markdown("---")
@@ -943,5 +1041,184 @@ elif page == "🔬 Model Info":
         "Knowing the market is in CRISIS regime changes "
         "which stocks you watch, even without a precise "
         "price forecast. That is the actionable insight."
+    )
+elif page == "🔮 30-Day Prediction":
+    st.title("🔮 30-Day Volatility Forecast")
+    st.markdown("*Live LSTM prediction · Updates every hour · Based on today's data*")
+    
+    st.markdown("---")
+    
+    # Current vs forecast
+    col1, col2, col3 = st.columns(3)
+    
+    col1.metric(
+        "Current Volatility",
+        f"{oil_data['garch_vol'].iloc[-1]:.3f}",
+        delta="Live GARCH estimate"
+    )
+    col2.metric(
+        "Current Regime",
+        oil_data['regimes'].iloc[-1]
+    )
+    col3.metric(
+        "Most Likely Next Regime",
+        forecast_df['predicted_regime'].mode()[0],
+        delta="30-day outlook"
+    )
+    
+    st.markdown("---")
+    
+    # Forecast chart
+    st.subheader("Predicted Volatility — Next 30 Trading Days")
+    
+    COLORS = {
+        "LOW": "#00d68f",
+        "ELEVATED": "#f5a623",
+        "HIGH": "#f6882d",
+        "CRISIS": "#e53e3e"
+    }
+    
+    fig = go.Figure()
+    
+    # Historical last 60 days
+    fig.add_trace(go.Scatter(
+        x=oil_data["Date"].tail(60),
+        y=oil_data["garch_vol"].tail(60),
+        mode="lines",
+        name="Historical GARCH Vol",
+        line=dict(color="#4299e1", width=1.5)
+    ))
+    
+    # Forecast
+    fig.add_trace(go.Scatter(
+        x=forecast_df["Date"],
+        y=forecast_df["predicted_vol"],
+        mode="lines+markers",
+        name="LSTM Forecast",
+        line=dict(color="#f5a623", width=2, dash="dot"),
+        marker=dict(size=4)
+    ))
+    
+    # Vertical line at today
+    fig.add_vline(
+        x=str(oil_data["Date"].iloc[-1].date()),
+        line=dict(color="#718096", width=1.5, dash="dash")
+    )
+    fig.add_annotation(
+        x=str(oil_data["Date"].iloc[-1].date()),
+        y=oil_data["garch_vol"].max(),
+        text="Today",
+        showarrow=False,
+        font=dict(color="#718096", size=11),
+        bgcolor="#0e1117"
+    )
+    
+    fig.update_layout(
+        height=400,
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font_color="#fafafa",
+        xaxis_title="Date",
+        yaxis_title="Conditional Volatility",
+        legend=dict(bgcolor="rgba(0,0,0,0)")
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Regime forecast table
+    st.subheader("Day by Day Regime Forecast")
+    
+    display_df = forecast_df.copy()
+    display_df["Date"] = display_df["Date"].dt.strftime("%b %d, %Y")
+    display_df.columns = ["Date", "Predicted Volatility", "Predicted Regime"]
+    display_df["Predicted Volatility"] = display_df["Predicted Volatility"].round(4)
+    
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    st.markdown("---")
 
+    # Current predicted regime for stock recommendations
+    predicted_regime = forecast_df['predicted_regime'].mode()[0]
+    
+    st.subheader(f"📊 Stock Recommendations for {predicted_regime} Regime")
+    st.markdown(f"*Based on 17 years of historical performance during {predicted_regime} periods*")
+    
+    # Filter regime performance data
+    regime_data = perf[perf['regime'] == predicted_regime].copy()
+    
+    # Top performers
+    top_performers = regime_data.nlargest(5, 'win_rate')[
+        ['stock', 'win_rate', 'mean_return']
+    ].reset_index(drop=True)
+    
+    # Top losers
+    top_losers = regime_data.nsmallest(5, 'win_rate')[
+        ['stock', 'win_rate', 'mean_return']
+    ].reset_index(drop=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 🏆 Top Performers")
+        st.markdown(f"*Highest win rates in {predicted_regime} regime*")
+        
+        for i, row in top_performers.iterrows():
+            st.markdown(
+                f'<div style="background:#0d2a1a; border:1px solid #00d68f; '
+                f'border-radius:8px; padding:12px 16px; margin:6px 0">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center">'
+                f'<div style="font-family:JetBrains Mono; font-weight:700; '
+                f'color:#e2e8f0; font-size:0.95rem">{row["stock"]}</div>'
+                f'<div>'
+                f'<span style="color:#00d68f; font-family:JetBrains Mono; '
+                f'font-weight:600; font-size:0.9rem">{row["win_rate"]:.1f}% win</span>'
+                f'&nbsp;&nbsp;'
+                f'<span style="color:#718096; font-family:JetBrains Mono; '
+                f'font-size:0.8rem">{row["mean_return"]:.2f}% avg return</span>'
+                f'</div></div></div>',
+                unsafe_allow_html=True
+            )
+    
+    with col2:
+        st.markdown("### ⚠️ Underperformers")
+        st.markdown(f"*Lowest win rates in {predicted_regime} regime*")
+        
+        for i, row in top_losers.iterrows():
+            st.markdown(
+                f'<div style="background:#2a0a0a; border:1px solid #e53e3e; '
+                f'border-radius:8px; padding:12px 16px; margin:6px 0">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center">'
+                f'<div style="font-family:JetBrains Mono; font-weight:700; '
+                f'color:#e2e8f0; font-size:0.95rem">{row["stock"]}</div>'
+                f'<div>'
+                f'<span style="color:#e53e3e; font-family:JetBrains Mono; '
+                f'font-weight:600; font-size:0.9rem">{row["win_rate"]:.1f}% win</span>'
+                f'&nbsp;&nbsp;'
+                f'<span style="color:#718096; font-family:JetBrains Mono; '
+                f'font-size:0.8rem">{row["mean_return"]:.2f}% avg return</span>'
+                f'</div></div></div>',
+                unsafe_allow_html=True
+            )
+    
+    st.markdown("---")
+    
+    st.info(
+        f"💡 The model predicts **{predicted_regime}** as the most likely regime "
+        f"over the next 30 trading days. Historically, the stocks above have shown "
+        f"the strongest and weakest performance during {predicted_regime} periods. "
+        f"This is based on 17 years of data — not financial advice."
+    )
+    st.markdown("---")
+
+    
+    st.warning(
+        "⚠️ Honest Assessment: 53% directional accuracy on test data. "
+        "This forecast shows the model's expectation of volatility mean reversion "
+        "based on 17 years of learned patterns. Use as one signal among many — "
+        "not as standalone trading advice."
     )
