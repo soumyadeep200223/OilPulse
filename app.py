@@ -12,12 +12,21 @@ from tensorflow.keras.models import load_model
 from datetime import timedelta
 import warnings
 warnings.filterwarnings('ignore')
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=7200)
 def run_live_pipeline():
-    
-    # Step 1 — Fetch live data
-    ticker = yf.Ticker("BZ=F")
-    df = ticker.history(period="3y")
+    # Step 1 — Fetch live data with retry
+    import time
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker("BZ=F")
+            df = ticker.history(period="3y")
+            if len(df) > 0:
+                break
+        except Exception:
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                raise
     df = df[["Close"]].reset_index()
     df.columns = ["Date", "Close"]
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
@@ -257,7 +266,15 @@ header[data-testid="stHeader"] {
 </style>
 """, unsafe_allow_html=True)
 #load data
-oil_data,forecast_df = run_live_pipeline()
+try:
+    oil_data, forecast_df = run_live_pipeline()
+except Exception:
+    st.error(
+        "⚠️ Live data temporarily unavailable. "
+        "Yahoo Finance is rate limiting this server. "
+        "Please refresh in 2-3 minutes."
+    )
+    st.stop()
 perf = pd.read_csv('regime_performance.csv')
 #sidebar
 last = oil_data.iloc[-1]
