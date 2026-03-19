@@ -104,7 +104,7 @@ def run_live_pipeline():
     return df, forecast_df
 def get_latest_oil_news():
     try:
-        api_key = "bcf1e4a7be1843129f9d5e92cf207e01"
+        api_key = st.secrets["NEWSAPI_KEY"]
         url = (
             f"https://newsapi.org/v2/everything?"
             f"q=oil+crude+OPEC&"
